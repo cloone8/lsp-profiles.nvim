@@ -75,7 +75,7 @@ available there.
 
 | Command | |
 |---|---|
-| `:LspProfile` | Pick a profile with `vim.ui.select()` |
+| `:LspProfile` | Pick a profile with `vim.ui.select()`, previewing what each one overrides (in pickers that support `preview_item`) |
 | `:LspProfile {name}` | Use profile `{name}` in the current buffer's workspace |
 | `:LspProfile none` | Use no profile |
 | `:LspProfile edit` | Edit the workspace's profiles file (created from a template) |

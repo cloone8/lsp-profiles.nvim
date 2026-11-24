@@ -196,6 +196,27 @@ elseif phase == '2' then
     check(s(a).target == 'wasm64', 'remembered profile applied at startup', s(a))
     check(profiles.status(buf_a) == 'web', 'status after restart of Neovim')
 
+    -- Picker: items, and the preview of each profile
+    local select_items, select_opts
+    local orig_select = vim.ui.select
+    ---@diagnostic disable-next-line: duplicate-set-field
+    vim.ui.select = function(items, opts) select_items, select_opts = items, opts end
+    profiles.pick()
+    vim.ui.select = orig_select
+    check(vim.deep_equal(select_items, { 'none', 'other_only', 'web' }), 'pick: items', select_items)
+    local function preview(item)
+        local buf = select_opts.preview_item(item).buf
+        return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), '\n'), vim.bo[buf].filetype
+    end
+    local web, ft = preview('web')
+    check(ft == 'lua', 'preview: lua buffer')
+    check(web:find('-- web (active)', 1, true) and web:find('target = "wasm64"', 1, true)
+        and web:find('fake = {', 1, true) and not web:find('restarts', 1, true), 'preview: active profile', web)
+    local none = preview('none')
+    check(none:find('restarts: fake', 1, true) and none:find('No overrides', 1, true), 'preview: none', none)
+    local other = preview('other_only')
+    check(other:find('restarts: fake', 1, true) and other:find('other = {', 1, true), 'preview: other profile', other)
+
     -- :LspProfile edit on a workspace without a file gives the template
     local buf_b = open(ws_b .. '/main.fake')
     client_for(buf_b, 'fake')

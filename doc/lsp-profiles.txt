@@ -64,7 +64,9 @@ are available.
 
                                                                  *:LspProfile*
 :LspProfile             Pick the profile of the current buffer's workspace
-                        with |vim.ui.select()|.
+                        with |vim.ui.select()|. Pickers that support its
+                        `preview_item` show what each profile overrides, and
+                        which running servers choosing it restarts.
 
 :LspProfile {name}      Use profile {name} in the current buffer's
                         workspace, and restart the language servers the old

@@ -355,17 +355,17 @@ local function restart(client)
     end))
 end
 
---- Restarts the servers in `ws` that need it for its active profile: those
---- with another profile merged in, or that the active one overrides but
---- isn't merged into yet. With `all`, also those that already have it (for
---- a changed profiles file).
+--- The running servers in `ws` that profile `name` (nil: none) needs
+--- restarted: those with another profile merged in, or that it overrides
+--- but isn't merged into yet. With `all`, also those that already have it
+--- (for a changed profiles file). Sorted by name.
 ---@param ws string
+---@param name string?
 ---@param all? boolean
----@return string[] names of the restarted servers
-local function restart_workspace(ws, all)
-    local name = load_state()[ws]
+---@return vim.lsp.Client[]
+local function needing_restart(ws, name, all)
     local profile = name and profiles_for(ws)[name] or {}
-    local restarted = {}
+    local list = {}
     for id, info in pairs(clients) do
         local client = vim.lsp.get_client_by_id(id)
         if not client then
@@ -373,13 +373,29 @@ local function restart_workspace(ws, all)
         elseif info.workspace == ws then
             local want = profile[client.name] and name or nil
             if info.profile ~= want or (all and want) then
-                table.insert(restarted, client.name)
-                restart(client)
+                table.insert(list, client)
             end
         end
     end
-    table.sort(restarted)
-    return restarted
+    table.sort(list, function(a, b) return a.name < b.name end)
+    return list
+end
+
+local function client_names(list)
+    return vim.tbl_map(function(client) return client.name end, list)
+end
+
+--- Restarts the servers in `ws` that need it for its active profile (see
+--- needing_restart())
+---@param ws string
+---@param all? boolean
+---@return string[] names of the restarted servers
+local function restart_workspace(ws, all)
+    local list = needing_restart(ws, load_state()[ws], all)
+    for _, client in ipairs(list) do
+        restart(client)
+    end
+    return client_names(list)
 end
 
 -------------------------------------------------------------------------------
@@ -460,8 +476,43 @@ function M.set(name, ws)
     return true
 end
 
+--- Preview of profile `name` ('none': no profile) in the picker, as Lua:
+--- what it overrides per server, and which running servers choosing it
+--- restarts
+---@param ws string
+---@param name string
+---@param active string Active profile, or 'none'
+---@param profiles table<string, table<string, table>>
+---@return string[]
+function M._preview_lines(ws, name, active, profiles)
+    local lines = { '-- ' .. name .. (name == active and ' (active)' or '') }
+    local restarts = client_names(needing_restart(ws, name ~= 'none' and name or nil))
+    if #restarts > 0 then
+        table.insert(lines, '-- Choosing it restarts: ' .. table.concat(restarts, ', '))
+    elseif name ~= active then
+        table.insert(lines, '-- Choosing it restarts nothing (none of its servers are running here)')
+    end
+    table.insert(lines, '')
+
+    if name == 'none' then
+        table.insert(lines, '-- No overrides: every server uses its own config')
+        return lines
+    end
+    local profile = profiles[name] or {}
+    local servers = vim.tbl_keys(profile)
+    table.sort(servers)
+    for i, server in ipairs(servers) do
+        if i > 1 then
+            table.insert(lines, '')
+        end
+        vim.list_extend(lines, vim.split(server .. ' = ' .. vim.inspect(profile[server]), '\n'))
+    end
+    return lines
+end
+
 --- Picks the active profile of the current buffer's workspace with
---- vim.ui.select()
+--- vim.ui.select(), previewing each profile's overrides (in pickers that
+--- support `preview_item`)
 function M.pick()
     local ws = M.workspace()
     if not ws then
@@ -470,13 +521,22 @@ function M.pick()
         return
     end
     local active = M.get(ws) or 'none'
-    local names = vim.tbl_keys(profiles_for(ws, true))
+    local profiles = profiles_for(ws, true)
+    local names = vim.tbl_keys(profiles)
     table.sort(names)
     local items = vim.list_extend({ 'none' }, names)
     vim.ui.select(items, {
         prompt = 'LSP profile',
+        kind = 'lsp-profiles',
         format_item = function(item)
             return item == active and (item .. ' (active)') or item
+        end,
+        preview_item = function(item)
+            local buf = api.nvim_create_buf(false, true)
+            api.nvim_buf_set_lines(buf, 0, -1, false, M._preview_lines(ws, item, active, profiles))
+            vim.bo[buf].bufhidden = 'wipe'
+            vim.bo[buf].filetype = 'lua'
+            return { buf = buf }
         end,
     }, function(choice)
         if choice then
