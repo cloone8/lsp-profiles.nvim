@@ -59,8 +59,9 @@ return {
   `cmd`, `cmd_env`, … The profile is merged in before the server starts.
 - **Merging**: tables are merged key by key. Anything else in the profile,
   including lists (and `{}`), replaces the value.
-- **Data, not code**: the file runs without access to `vim` or Lua's standard
-  library, so it can only build a table.
+- **Restricted, but treat it as code**: the file runs without access to `vim`
+  or Lua's standard library, so it can only build a table. But that table can
+  override `cmd`, which decides what program runs as the language server.
 - **Trust**: like Neovim's `'exrc'` files, the file is only read after
   `vim.secure.read()` has asked whether you trust it (again after anyone else
   changes it). Saving it in Neovim trusts it, as you wrote it yourself. The

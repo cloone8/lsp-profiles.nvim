@@ -187,13 +187,48 @@ if phase == '1' then
     a = restarted(buf_a, 'fake', a)
     check(s(a).target == 'wasm64', 'written profiles file applied', s(a))
 
+    -- Saving a change to another profile restarts nothing
+    local a_other_now = client_for(buf_a, 'other')
+    vim.api.nvim_buf_call(edit_buf, function()
+        vim.cmd([[silent %s/"other"/"other2"/]])
+        vim.cmd('silent write')
+    end)
+    vim.wait(300)
+    check(client_for(buf_a, 'fake').id == a.id and client_for(buf_a, 'other').id == a_other_now.id,
+        'saving another profile: no restart')
+
+    -- Saving a version that fails to load leaves the servers alone
+    vim.api.nvim_buf_call(edit_buf, function()
+        vim.cmd([[silent %s/^}$/}}/]])
+        vim.cmd('silent write')
+    end)
+    vim.wait(300)
+    check(client_for(buf_a, 'fake').id == a.id and s(a).target == 'wasm64', 'saving a broken file: no restart')
+    vim.api.nvim_buf_call(edit_buf, function()
+        vim.cmd([[silent %s/^}}$/}/]])
+        vim.cmd('silent write')
+    end)
+    vim.wait(300)
+
+    -- Changed outside Neovim (and trusted again): :LspProfile web applies it
+    local lines = vim.fn.readfile(file_a)
+    for i, line in ipairs(lines) do
+        lines[i] = line:gsub('"wasm64"', '"wasm32"')
+    end
+    vim.fn.writefile(lines, file_a)
+    vim.secure.trust({ action = 'allow', path = file_a })
+    vim.api.nvim_set_current_buf(buf_a)
+    vim.cmd('LspProfile web')
+    a = restarted(buf_a, 'fake', a)
+    check(s(a).target == 'wasm32', 'outside change applied by :LspProfile', s(a))
+
     -- Leave "web" active for phase 2
     print('phase 1 done')
 elseif phase == '2' then
     local buf_a = open(ws_a .. '/src/main.fake')
     local a = client_for(buf_a, 'fake')
     check(profiles.get(ws_a) == 'web', 'active profile remembered')
-    check(s(a).target == 'wasm64', 'remembered profile applied at startup', s(a))
+    check(s(a).target == 'wasm32', 'remembered profile applied at startup', s(a))
     check(profiles.status(buf_a) == 'web', 'status after restart of Neovim')
 
     -- Picker: items, and the preview of each profile
@@ -210,7 +245,7 @@ elseif phase == '2' then
     end
     local web, ft = preview('web')
     check(ft == 'lua', 'preview: lua buffer')
-    check(web:find('-- web (active)', 1, true) and web:find('target = "wasm64"', 1, true)
+    check(web:find('-- web (active)', 1, true) and web:find('target = "wasm32"', 1, true)
         and web:find('fake = {', 1, true) and not web:find('restarts', 1, true), 'preview: active profile', web)
     local none = preview('none')
     check(none:find('restarts: fake', 1, true) and none:find('No overrides', 1, true), 'preview: none', none)
@@ -257,12 +292,41 @@ elseif phase == '2' then
     c = restarted(buf_c, 'fake', c)
     check(s(c).target == 'evil', 'trusted later: profile applied', s(c))
 
+    -- The file changes outside Neovim and is no longer trusted while its
+    -- profile is active: the server still starts, with its base config
+    vim.fn.writefile({ 'return { web = { fake = { settings = { fake = { target = "changed" } } } } }' }, file_c)
+    vim.secure.trust({ action = 'deny', path = file_c })
+    vim.api.nvim_set_current_buf(buf_c)
+    vim.cmd('lsp restart fake')
+    c = restarted(buf_c, 'fake', c)
+    check(s(c).target == 'native', 'untrusted while active: server starts with base config', s(c))
+
     -- Setting the profile that is already applied restarts nothing
     vim.api.nvim_set_current_buf(buf_a)
-    local before = vim.lsp.get_clients({ bufnr = buf_a, name = 'fake' })[1]
+    vim.wait(300) -- let the :lsp restart above settle
+    local before = client_for(buf_a, 'fake')
     check(profiles.set('web') == true, 'set active profile again')
     vim.wait(300)
-    check(vim.lsp.get_clients({ bufnr = buf_a, name = 'fake' })[1].id == before.id, 'already applied: no restart')
+    check(client_for(buf_a, 'fake').id == before.id, 'already applied: no restart')
+
+    -- A bug in the profile lookup doesn't keep servers from starting
+    local ws_d = vim.fs.joinpath(tmp, 'd')
+    vim.fn.mkdir(ws_d, 'p')
+    vim.fn.writefile({}, ws_d .. '/.root')
+    local file = profiles.file
+    profiles.file = {} -- makes the lookup throw
+    local d = client_for(open(ws_d .. '/main.fake'), 'fake')
+    profiles.file = file
+    check(d ~= nil and s(d).target == 'native', 'lookup error: server still starts')
+
+    -- Another Neovim's saved choice survives this one's set()
+    local state_file = vim.fs.joinpath(vim.fn.stdpath('state'), 'lsp-profiles.json')
+    local saved = vim.json.decode(table.concat(vim.fn.readfile(state_file), '\n'))
+    saved['/elsewhere'] = 'web'
+    vim.fn.writefile({ vim.json.encode(saved) }, state_file)
+    profiles.set('none', ws_a)
+    saved = vim.json.decode(table.concat(vim.fn.readfile(state_file), '\n'))
+    check(saved['/elsewhere'] == 'web' and saved[ws_a] == nil, 'state: other instance\'s choice kept', saved)
     print('phase 2 done')
 end
 

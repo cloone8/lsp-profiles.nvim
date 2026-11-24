@@ -49,7 +49,9 @@ Any field of the config can be overridden (`settings`, `init_options`, `cmd`,
 `cmd_env`, ...). Tables are merged key by key. Anything else, including lists
 and `{}`, replaces the value.
 
-The file is data: it runs without access to `vim` or Lua's standard library.
+The file runs without access to `vim` or Lua's standard library, so it can
+only build a table. But that table can override `cmd`, which decides what
+program runs as the language server, so treat the file as code.
 Like 'exrc' files, it is only read after |vim.secure.read()| has asked
 whether you trust it. Writing it in Neovim trusts it automatically.
 

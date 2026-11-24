@@ -34,8 +34,9 @@ local file_cache = {}
 local bases = setmetatable({}, { __mode = 'k' })
 
 --- Client id -> { workspace = folder, profile = name of the profile merged
---- into its config, if any }
----@type table<integer, { workspace: string, profile: string? }>
+--- into its config and override = what it merged in (if any) }
+---@alias lsp-profiles.ClientInfo { workspace: string, profile: string?, override: table? }
+---@type table<integer, lsp-profiles.ClientInfo>
 local clients = {}
 
 local original_start ---@type fun(config: vim.lsp.ClientConfig, opts?: vim.lsp.start.Opts): integer?
@@ -46,6 +47,16 @@ end
 
 local function display(path)
     return vim.fn.fnamemodify(path, ':~')
+end
+
+local function sorted_keys(t)
+    local keys = vim.tbl_keys(t)
+    table.sort(keys)
+    return keys
+end
+
+local function warn_no_workspace()
+    notify('no workspace here: no language server attached and no ' .. M.file .. ' found', vim.log.levels.WARN)
 end
 
 ---@param bufnr integer?
@@ -65,19 +76,22 @@ local function is_dict(v)
     return type(v) == 'table' and not vim.islist(v)
 end
 
+local function merge_into(dst, override)
+    for k, v in pairs(override) do
+        if is_dict(v) and is_dict(dst[k]) then
+            merge_into(dst[k], v)
+        else
+            dst[k] = vim.deepcopy(v)
+        end
+    end
+    return dst
+end
+
 --- `base` with `override` merged in, as a new table. Dictionaries are merged
 --- key by key; anything else in `override` (strings, numbers, lists, `{}`,
 --- functions) replaces the value in `base`.
 local function merge(base, override)
-    local out = vim.deepcopy(base)
-    for k, v in pairs(override) do
-        if is_dict(v) and is_dict(out[k]) then
-            out[k] = merge(out[k], v)
-        else
-            out[k] = vim.deepcopy(v)
-        end
-    end
-    return out
+    return merge_into(vim.deepcopy(base), override)
 end
 M._merge = merge
 
@@ -89,9 +103,12 @@ local function state_path()
     return vim.fs.joinpath(vim.fn.stdpath('state'), 'lsp-profiles.json')
 end
 
+--- The active profiles (read from disk on first use, or when `reload`: before
+--- changing them, so another Neovim's changes aren't overwritten)
+---@param reload? boolean
 ---@return table<string, string>
-local function load_state()
-    if state then
+local function load_state(reload)
+    if state and not reload then
         return state
     end
     state = {}
@@ -235,7 +252,7 @@ local function profiles_for(ws, retry)
 end
 
 --- The override for `server` from `ws`'s active profile, and that profile's
---- name; nil without one
+--- name; nil if the profile doesn't override it (or there's none)
 ---@return table? override, string? profile
 local function active_override(ws, server)
     local name = load_state()[ws]
@@ -243,27 +260,31 @@ local function active_override(ws, server)
         return nil
     end
     local profile = profiles_for(ws)[name]
-    local cached = file_cache[vim.fs.joinpath(ws, M.file)]
-    if not profile and not (cached and cached.profiles == false) then
-        vim.notify_once(('lsp-profiles: profile "%s" for %s no longer exists; using none'):format(name, display(ws)),
-            vim.log.levels.WARN)
+    if not profile then
+        -- Unless its file failed to load (that already warned)
+        local cached = file_cache[vim.fs.joinpath(ws, M.file)]
+        if not (cached and cached.profiles == false) then
+            vim.notify_once(('lsp-profiles: profile "%s" for %s no longer exists; using none'):format(name, display(ws)),
+                vim.log.levels.WARN)
+        end
         return nil
     end
-    return profile[server], name
+    if profile[server] then
+        return profile[server], name
+    end
 end
 
 -------------------------------------------------------------------------------
 -- The vim.lsp.start() wrapper
 -------------------------------------------------------------------------------
 
+--- The config and options to start a server with: `config` with its
+--- workspace's active profile merged in. Also what to record about the
+--- client (nil outside a workspace).
 ---@param config vim.lsp.ClientConfig
----@param opts? vim.lsp.start.Opts
----@return integer? client_id
-local function start(config, opts)
-    opts = opts or {}
-    -- A config we merged a profile into (from :lsp restart): start over from
-    -- the one before
-    config = bases[config] or config
+---@param opts vim.lsp.start.Opts
+---@return vim.lsp.ClientConfig, vim.lsp.start.Opts, lsp-profiles.ClientInfo?
+local function resolve(config, opts)
     local bufnr = resolve_buf(opts.bufnr)
 
     -- vim.lsp.enable() leaves finding the root from `root_markers` to
@@ -288,20 +309,40 @@ local function start(config, opts)
         root = nil
     end
     local ws = find_workspace(root or api.nvim_buf_get_name(bufnr)) or root
-
-    local override, profile
-    if ws then
-        override, profile = active_override(ws, config.name)
-    end
-    local start_config = config
-    if override then
-        start_config = merge(config, override)
-        bases[start_config] = config
+    if not ws then
+        return config, opts, nil
     end
 
-    local id = original_start(start_config, opts)
-    if id and ws and not clients[id] then
-        clients[id] = { workspace = ws, profile = override and profile or nil }
+    local override, profile = active_override(ws, config.name)
+    if not override then
+        return config, opts, { workspace = ws }
+    end
+    local merged = merge(config, override)
+    bases[merged] = config
+    return merged, opts, { workspace = ws, profile = profile, override = override }
+end
+
+---@param config vim.lsp.ClientConfig
+---@param opts? vim.lsp.start.Opts
+---@return integer? client_id
+local function start(config, opts)
+    opts = opts or {}
+    -- A config we merged a profile into (from :lsp restart): start over from
+    -- the one before
+    config = bases[config] or config
+
+    -- A bug here must not keep the server from starting: then start it
+    -- without a profile
+    local ok, start_config, start_opts, info = pcall(resolve, config, opts)
+    if not ok then
+        vim.notify_once('lsp-profiles: ' .. tostring(start_config) .. ' (starting without a profile)',
+            vim.log.levels.ERROR)
+        return original_start(config, opts)
+    end
+
+    local id = original_start(start_config, start_opts)
+    if id and info and not clients[id] then
+        clients[id] = info
     end
     return id
 end
@@ -356,25 +397,20 @@ local function restart(client)
 end
 
 --- The running servers in `ws` that profile `name` (nil: none) needs
---- restarted: those with another profile merged in, or that it overrides
---- but isn't merged into yet. With `all`, also those that already have it
---- (for a changed profiles file). Sorted by name.
+--- restarted: those whose merged-in override differs from what the profile
+--- (as it is now) has for them. Sorted by name.
 ---@param ws string
 ---@param name string?
----@param all? boolean
 ---@return vim.lsp.Client[]
-local function needing_restart(ws, name, all)
+local function needing_restart(ws, name)
     local profile = name and profiles_for(ws)[name] or {}
     local list = {}
     for id, info in pairs(clients) do
         local client = vim.lsp.get_client_by_id(id)
         if not client then
             clients[id] = nil
-        elseif info.workspace == ws then
-            local want = profile[client.name] and name or nil
-            if info.profile ~= want or (all and want) then
-                table.insert(list, client)
-            end
+        elseif info.workspace == ws and not vim.deep_equal(info.override, profile[client.name]) then
+            table.insert(list, client)
         end
     end
     table.sort(list, function(a, b) return a.name < b.name end)
@@ -388,10 +424,9 @@ end
 --- Restarts the servers in `ws` that need it for its active profile (see
 --- needing_restart())
 ---@param ws string
----@param all? boolean
 ---@return string[] names of the restarted servers
-local function restart_workspace(ws, all)
-    local list = needing_restart(ws, load_state()[ws], all)
+local function restart_workspace(ws)
+    local list = needing_restart(ws, load_state()[ws])
     for _, client in ipairs(list) do
         restart(client)
     end
@@ -423,10 +458,7 @@ end
 ---@param ws? string (default: the current buffer's)
 ---@return string[]
 function M.list(ws)
-    ws = ws or M.workspace()
-    local names = vim.tbl_keys(profiles_for(ws))
-    table.sort(names)
-    return names
+    return sorted_keys(profiles_for(ws or M.workspace()))
 end
 
 --- The active profile of a workspace, or nil
@@ -448,8 +480,7 @@ function M.set(name, ws)
     end
     ws = ws or M.workspace()
     if not ws then
-        notify('no workspace here: no language server attached and no ' .. M.file .. ' found',
-            vim.log.levels.WARN)
+        warn_no_workspace()
         return false
     end
     if name and not profiles_for(ws, true)[name] then
@@ -457,7 +488,7 @@ function M.set(name, ws)
         return false
     end
 
-    local st = load_state()
+    local st = load_state(true)
     local changed = st[ws] ~= name
     if changed then
         st[ws] = name
@@ -465,14 +496,13 @@ function M.set(name, ws)
     end
 
     local restarted = restart_workspace(ws)
+    local label = name and ('profile "' .. name .. '"') or 'no profile'
     if not changed and #restarted == 0 then
-        notify(('already using %s'):format(name and ('profile "' .. name .. '"') or 'no profile'))
-        return true
+        notify('already using ' .. label)
+    else
+        notify(('%s for %s%s'):format(label, display(ws),
+            #restarted > 0 and ('; restarting ' .. table.concat(restarted, ', ')) or ''))
     end
-    notify(('%s for %s%s'):format(
-        name and ('profile "' .. name .. '"') or 'no profile',
-        display(ws),
-        #restarted > 0 and ('; restarting ' .. table.concat(restarted, ', ')) or ''))
     return true
 end
 
@@ -499,9 +529,7 @@ function M._preview_lines(ws, name, active, profiles)
         return lines
     end
     local profile = profiles[name] or {}
-    local servers = vim.tbl_keys(profile)
-    table.sort(servers)
-    for i, server in ipairs(servers) do
+    for i, server in ipairs(sorted_keys(profile)) do
         if i > 1 then
             table.insert(lines, '')
         end
@@ -516,15 +544,12 @@ end
 function M.pick()
     local ws = M.workspace()
     if not ws then
-        notify('no workspace here: no language server attached and no ' .. M.file .. ' found',
-            vim.log.levels.WARN)
+        warn_no_workspace()
         return
     end
     local active = M.get(ws) or 'none'
     local profiles = profiles_for(ws, true)
-    local names = vim.tbl_keys(profiles)
-    table.sort(names)
-    local items = vim.list_extend({ 'none' }, names)
+    local items = vim.list_extend({ 'none' }, sorted_keys(profiles))
     vim.ui.select(items, {
         prompt = 'LSP profile',
         kind = 'lsp-profiles',
@@ -551,7 +576,8 @@ local template = {
     '-- Each profile maps language server names (as in vim.lsp.config()) to config',
     '-- that is merged over that server\'s own: settings, init_options, cmd, cmd_env, ...',
     '-- Tables are merged key by key; anything else, including lists, replaces.',
-    '-- This file is data: it runs without access to `vim` or the standard library.',
+    '-- It runs without access to `vim` or the standard library, but it can set `cmd`',
+    '-- (the program that runs), so Neovim asks whether you trust it before loading it.',
     'return {',
     '    -- example = {',
     '    --     rust_analyzer = {',
@@ -658,12 +684,14 @@ function M._install()
         desc = 'Trust a profiles file written in Neovim, and apply the changes',
         callback = function(ev)
             local path = vim.fs.normalize(api.nvim_buf_get_name(ev.buf))
-            -- You wrote it yourself, so don't ask whether to trust it
+            -- You wrote it yourself, so don't ask whether to trust it. (The
+            -- write changed its mtime, so it's read again.)
             vim.secure.trust({ action = 'allow', bufnr = ev.buf })
-            file_cache[path] = nil
             local ws = vim.fs.dirname(vim.fs.dirname(path))
-            if load_state()[ws] then
-                local restarted = restart_workspace(ws, true)
+            -- If it doesn't load now (say, a half-done edit), read_file()
+            -- warned; leave the servers as they are
+            if load_state()[ws] and read_file(path) then
+                local restarted = restart_workspace(ws)
                 if #restarted > 0 then
                     notify('profiles changed; restarting ' .. table.concat(restarted, ', '))
                 end
