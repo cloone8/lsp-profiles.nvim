@@ -1,0 +1,139 @@
+*lsp-profiles.txt*  Per-workspace LSP config profiles, switchable at runtime
+
+==============================================================================
+CONTENTS                                               *lsp-profiles-contents*
+
+  1. Introduction ...................................... |lsp-profiles-intro|
+  2. Profiles file ...................................... |lsp-profiles-file|
+  3. Commands ...................................... |lsp-profiles-commands|
+  4. Global profiles ................................. |lsp-profiles-global|
+  5. Lua API ............................................. |lsp-profiles-api|
+
+==============================================================================
+1. INTRODUCTION                                           *lsp-profiles-intro*
+
+lsp-profiles.nvim lets you define named sets of language server config
+overrides ("profiles") per workspace, and switch between them at runtime.
+The affected servers restart automatically, and the active profile is
+remembered per workspace.
+
+It works with any config set up through |vim.lsp.config()| and
+|vim.lsp.enable()| (or |vim.lsp.start()|): it wraps |vim.lsp.start()| and
+merges the active profile into a server's config just before it starts.
+
+Requires Neovim 0.12 or newer. Don't lazy-load the plugin: it needs to be
+loaded before your language servers start. |lsp-profiles.setup()| is
+optional.
+
+==============================================================================
+2. PROFILES FILE                                           *lsp-profiles-file*
+
+Profiles live in `.nvim/lsp-profiles.lua` at the root of a workspace (create
+or open it with `:LspProfile edit`). It returns a table of profiles, each of which
+maps language server names (as in |vim.lsp.config()|) to config that is
+merged over that server's own: >lua
+
+    return {
+        web = {
+            rust_analyzer = {
+                settings = {
+                    ['rust-analyzer'] = {
+                        cargo = { target = 'wasm32-unknown-unknown' },
+                    },
+                },
+            },
+        },
+    }
+<
+Any field of the config can be overridden (`settings`, `init_options`, `cmd`,
+`cmd_env`, ...). Tables are merged key by key. Anything else, including lists
+and `{}`, replaces the value.
+
+The file is data: it runs without access to `vim` or Lua's standard library.
+Like 'exrc' files, it is only read after |vim.secure.read()| has asked
+whether you trust it. Writing it in Neovim trusts it automatically.
+
+                                                      *lsp-profiles-workspace*
+The workspace of a language server is the nearest folder at or above its
+root (else above the file) that has a `.nvim/lsp-profiles.lua`. Without one,
+it is the server's root folder, where only |lsp-profiles-global| profiles
+are available.
+
+==============================================================================
+3. COMMANDS                                            *lsp-profiles-commands*
+
+                                                                 *:LspProfile*
+:LspProfile             Pick the profile of the current buffer's workspace
+                        with |vim.ui.select()|.
+
+:LspProfile {name}      Use profile {name} in the current buffer's
+                        workspace, and restart the language servers the old
+                        or the new profile affects.
+
+:LspProfile none        Use no profile (restarting the affected servers).
+
+:LspProfile edit        Edit the workspace's profiles file. A new one starts
+                        from a template.
+                        Writing it while a profile is active restarts the
+                        affected servers with the new values.
+
+The active profile per workspace is stored in
+`stdpath('state')/lsp-profiles.json`. `:lsp restart` keeps it.
+
+==============================================================================
+4. GLOBAL PROFILES                                       *lsp-profiles-global*
+
+Profiles passed to |lsp-profiles.setup()| are available in every workspace.
+A workspace file's profile with the same name is merged over the global one.
+
+                                                        *lsp-profiles.setup()*
+setup({opts})
+    Optional. {opts} is a table with:
+    - profiles: table of profiles, in the format of |lsp-profiles-file|. >lua
+
+    require('lsp-profiles').setup({
+        profiles = {
+            wasm = {
+                rust_analyzer = {
+                    settings = {
+                        ['rust-analyzer'] = {
+                            cargo = { target = 'wasm32-unknown-unknown' },
+                        },
+                    },
+                },
+            },
+        },
+    })
+<
+==============================================================================
+5. LUA API                                                  *lsp-profiles-api*
+
+In `require('lsp-profiles')`. {ws} is a workspace folder and defaults to the
+current buffer's; {bufnr} defaults to the current buffer.
+
+set({name}, {ws})                                         *lsp-profiles.set()*
+    Makes {name} the active profile (nil or "none": no profile), remembers
+    it, and restarts the affected servers. Returns false if there is no such
+    profile or no workspace.
+
+get({ws})                                                 *lsp-profiles.get()*
+    The active profile, or nil.
+
+list({ws})                                               *lsp-profiles.list()*
+    Sorted names of the available profiles.
+
+pick()                                                   *lsp-profiles.pick()*
+    Like `:LspProfile`.
+
+edit()                                                   *lsp-profiles.edit()*
+    Like `:LspProfile edit`.
+
+workspace({bufnr})                                  *lsp-profiles.workspace()*
+    The buffer's workspace: the one of its language servers, else the
+    nearest folder above it with a profiles file. Nil if neither exists.
+
+status({bufnr})                                        *lsp-profiles.status()*
+    The profile merged into the buffer's language servers, or nil. Meant for
+    a statusline.
+
+ vim:tw=78:ts=8:ft=help:norl:
